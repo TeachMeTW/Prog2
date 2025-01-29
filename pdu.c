@@ -20,6 +20,7 @@ int sendPDU(int socketNumber, const uint8_t *dataBuffer, int lengthOfData)
     int totalLen = lengthOfData + 2;
 
     // Allocate a temporary buffer to build the entire PDU
+    // can allocate array with max buffer instead due to overhead reasons (or c99 total length arr)
     uint8_t *pdu = (uint8_t*)malloc(totalLen);
     if (!pdu)
     {
