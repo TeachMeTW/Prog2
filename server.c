@@ -1,209 +1,252 @@
 /******************************************************************************
-* myServer.c
-*
-* Modified to:
-*   - Loop indefinitely until ^C
-*   - Use poll() to handle multiple clients
-*   - Assign each new client an incrementing ID: Client 1, Client 2, ...
-*   - On receiving data, print:
-*         "Message received on socket X from client Y, length: Z, Data: ..."
-*   - Use recvPDU() and sendPDU() for all I/O
-*
-* Original code by Prof. Smith, updated here for Lab Sockets Programming
-*
-*****************************************************************************/
+ * server.c
+ *
+ * Chat server program.
+ *
+ * Usage: chatServer [optional port-number]
+ *
+ * This server:
+ *  - Uses poll() (via pollLib) to accept new connections and process
+ *    data from connected clients.
+ *  - Processes client packets:
+ *      • Registration (flag=1): check for duplicate handle and add to table.
+ *      • Message (flag=5): forward %M messages.
+ *      • Broadcast (flag=4): forward %B messages.
+ *      • Multicast (flag=6): forward %C messages (and send error packets with flag=7 for each invalid dest).
+ *      • List request (flag=10): send a flag=11 packet (with count), then one flag=12 per handle, then flag=13.
+ *
+ * Client–handle/state information is stored in a separate “handle table” module.
+ *
+ * Author: Robin Simpson
+ * Lab Section: 3pm
+ *****************************************************************************/
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <sys/uio.h>
-#include <sys/time.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <stdint.h>
-
-#include "networks.h"
-#include "safeUtil.h"
-#include "pollLib.h"
+#include <unistd.h>
 #include "pdu.h"
+#include "networks.h"
+#include "pollLib.h"
+#include "handleTable.h"
 
-#define MAXBUF 1024
-#define DEBUG_FLAG 1
+#define MAXBUF    1400
+#define MAX_HANDLE 100
 
-// forward declarations
-int checkArgs(int argc, char *argv[]);
-static void serverControl(int mainServerSocket);
-static void addNewSocket(int mainServerSocket);
-static void processClient(int clientSocket);
+/* Function prototypes */
+void processClientSocket(int sock);
+void processRegistration(int sock, uint8_t *buffer, int len);
+void processBroadcast(int sock, uint8_t *buffer, int len);
+void processMessage(int sock, uint8_t *buffer, int len);
+void processMulticast(int sock, uint8_t *buffer, int len);
+void processListRequest(int sock, uint8_t *buffer, int len);
+void sendErrorPacket(int sock, const char *destHandle);
 
-// We'll keep track of each client's "ID" in this map.
-//   clientIDMap[socketFD] = the unique ID we assigned to that socket.
-static int clientIDMap[1024];
-
-// We'll increment this for each new connection: Client 1, Client 2, etc.
-static int nextClientID = 1;
-
-int main(int argc, char *argv[])
-{
-    int mainServerSocket = 0;
-    int portNumber = 0;
-
-    portNumber = checkArgs(argc, argv);
-
-    // create the server socket
-    mainServerSocket = tcpServerSetup(portNumber);
-    printf("Server listening forever... ^C to quit\n");
-
-    // run a poll-based loop to handle multiple clients
-    serverControl(mainServerSocket);
-
-    // never gets here unless you break out
-    close(mainServerSocket);
+int main(int argc, char *argv[]) {
+    int port = 0;
+    if (argc > 2) {
+        fprintf(stderr, "Usage: %s [optional port number]\n", argv[0]);
+        exit(1);
+    }
+    if (argc == 2)
+        port = atoi(argv[1]);
+    int listenSock = tcpServerSetup(port);
+    setupPollSet();
+    addToPollSet(listenSock);
+    initHandleTable();
+    while (1) {
+        int ready = pollCall(-1);
+        if (ready == listenSock) {
+            int clientSock = tcpAccept(listenSock, 0);
+            addToPollSet(clientSock);
+        } else {
+            processClientSocket(ready);
+        }
+    }
     return 0;
 }
 
-/*
- * serverControl():
- *   - sets up poll with the mainServerSocket
- *   - in an infinite loop:
- *       pollCall()
- *       if ready FD == mainServerSocket => accept new client => addToPollSet
- *       else => processClient(ready FD)
- */
-static void serverControl(int mainServerSocket)
-{
-    int readyFd = 0;
+void processClientSocket(int sock) {
+    uint8_t buf[MAXBUF];
+    int len = recvPDU(sock, buf, MAXBUF);
+    if (len <= 0) {
+        /* Client disconnected; remove from handle table (if registered) */
+        char *handle = lookupHandleBySocket(sock);
+        if (handle != NULL)
+            printf("Client %s disconnected.\n", handle);
+        removeHandleBySocket(sock);
+        removeFromPollSet(sock);
+        close(sock);
+        return;
+    }
+    uint8_t flag = buf[0];
+    switch (flag) {
+        case 1:
+            processRegistration(sock, buf, len);
+            break;
+        case 4:
+            processBroadcast(sock, buf, len);
+            break;
+        case 5:
+            processMessage(sock, buf, len);
+            break;
+        case 6:
+            processMulticast(sock, buf, len);
+            break;
+        case 10:
+            processListRequest(sock, buf, len);
+            break;
+        default:
+            /* Unknown flag: ignore */
+            break;
+    }
+}
 
-    setupPollSet();
-    addToPollSet(mainServerSocket);
-
-    while (1)
+void processRegistration(int sock, uint8_t *buffer, int len) {
+    /* Registration packet: flag=1, then 1-byte handle length, then handle */
+    if (len < 2) return;
+    uint8_t hlen = buffer[1];
+    if (len < 2 + hlen) return;
+    char handle[MAX_HANDLE+1];
+    if (hlen > MAX_HANDLE) {
+        uint8_t resp = 3; // error (handle too long)
+        sendPDU(sock, &resp, 1);
+        close(sock);
+        removeFromPollSet(sock);
+        return;
+    }
+    memcpy(handle, buffer + 2, hlen);
+    handle[hlen] = '\0';
+    if (lookupSocketByHandle(handle) != -1) {
+        uint8_t resp = 3; // duplicate handle error
+        sendPDU(sock, &resp, 1);
+        close(sock);
+        removeFromPollSet(sock);
+        return;
+    }
+    addHandle(handle, sock);
     {
-        readyFd = pollCall(-1);
-        if (readyFd < 0)
-        {
-            // ignoring poll errors
-            continue;
-        }
+        uint8_t resp = 2; // registration accepted
+        sendPDU(sock, &resp, 1);
+    }
+    printf("Client registered: %s\n", handle);
+}
 
-        if (readyFd == mainServerSocket)
-        {
-            addNewSocket(mainServerSocket);
-        }
+void processBroadcast(int sock, uint8_t *buffer, int len) {
+    /* Broadcast packet: flag=4, then 1-byte sender handle length, then sender handle, then text */
+    int off = 1;
+    if (len < off + 1) return;
+    uint8_t shLen = buffer[off++];
+    char sender[MAX_HANDLE+1] = {0};
+    if (len < off + shLen) return;
+    memcpy(sender, buffer + off, shLen);
+    sender[shLen] = '\0';
+    off += shLen;
+    /* Forward to all clients except the sender */
+    struct ClientEntry *entry = getHandleTableHead();
+    while (entry) {
+        if (entry->socket != sock)
+            sendPDU(entry->socket, buffer, len);
+        entry = entry->next;
+    }
+}
+
+void processMessage(int sock, uint8_t *buffer, int len) {
+    /* %M message packet: flag=5, then sender handle, then (1 dest) then destination handle, then text */
+    int off = 1;
+    if (len < off + 1) return;
+    uint8_t shLen = buffer[off++];
+    char sender[MAX_HANDLE+1] = {0};
+    if (len < off + shLen) return;
+    memcpy(sender, buffer + off, shLen);
+    sender[shLen] = '\0';
+    off += shLen;
+    if (len < off + 1) return;
+    uint8_t destCount = buffer[off++];
+    if (destCount != 1) return;
+    if (len < off + 1) return;
+    uint8_t dhLen = buffer[off++];
+    char destHandle[MAX_HANDLE+1] = {0};
+    if (len < off + dhLen) return;
+    memcpy(destHandle, buffer + off, dhLen);
+    destHandle[dhLen] = '\0';
+    off += dhLen;
+    /* Look up destination and forward packet */
+    int destSock = lookupSocketByHandle(destHandle);
+    if (destSock == -1)
+        sendErrorPacket(sock, destHandle);
+    else
+        sendPDU(destSock, buffer, len);
+}
+
+void processMulticast(int sock, uint8_t *buffer, int len) {
+    /* Multicast packet: flag=6, then sender handle, then 1-byte number of dest,
+     * then for each destination: [1-byte length, dest handle],
+     * then text message.
+     */
+    int off = 1;
+    if (len < off + 1) return;
+    uint8_t shLen = buffer[off++];
+    char sender[MAX_HANDLE+1] = {0};
+    if (len < off + shLen) return;
+    memcpy(sender, buffer + off, shLen);
+    sender[shLen] = '\0';
+    off += shLen;
+    if (len < off + 1) return;
+    uint8_t numDest = buffer[off++];
+    for (int i = 0; i < numDest; i++) {
+        if (len < off + 1) return;
+        uint8_t dlen = buffer[off++];
+        char destHandle[MAX_HANDLE+1] = {0};
+        if (len < off + dlen) return;
+        memcpy(destHandle, buffer + off, dlen);
+        destHandle[dlen] = '\0';
+        off += dlen;
+        int destSock = lookupSocketByHandle(destHandle);
+        if (destSock == -1)
+            sendErrorPacket(sock, destHandle);
         else
-        {
-            // existing client has data
-            processClient(readyFd);
-        }
+            sendPDU(destSock, buffer, len);
     }
+    /* (Text message follows; no additional processing needed here.) */
 }
 
-/*
- * addNewSocket():
- *   - accept a new client
- *   - assign them a unique ID
- *   - print "Client N accepted. IP/Port..."
- *   - add to poll set
- */
-static void addNewSocket(int mainServerSocket)
-{
-    struct sockaddr_in6 clientAddress;
-    socklen_t addrLen = sizeof(clientAddress);
-
-    // do accept() yourself, so we can gather IP info
-    int clientSocket = accept(mainServerSocket, (struct sockaddr*)&clientAddress, &addrLen);
-    if (clientSocket < 0)
-    {
-        perror("accept");
-        return;
+void processListRequest(int sock, uint8_t *buffer, int len) {
+    /* List request: flag=10. Reply with:
+     *  - A packet with flag=11 and a 4-byte count.
+     *  - Then one flag=12 packet per handle.
+     *  - Finally, a flag=13 packet.
+     */
+    uint32_t count = getHandleCount();
+    uint32_t count_net = htonl(count);
+    uint8_t resp[1 + 4];
+    resp[0] = 11;
+    memcpy(resp + 1, &count_net, 4);
+    sendPDU(sock, resp, sizeof(resp));
+    struct ClientEntry *entry = getHandleTableHead();
+    while (entry) {
+        uint8_t pkt[1 + 1 + MAX_HANDLE];
+        int off = 0;
+        pkt[off++] = 12;
+        uint8_t hlen = (uint8_t) strlen(entry->handle);
+        pkt[off++] = hlen;
+        memcpy(pkt + off, entry->handle, hlen);
+        off += hlen;
+        sendPDU(sock, pkt, off);
+        entry = entry->next;
     }
-
-    // figure out the IP/port in text form
-    char ipString[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &clientAddress.sin6_addr, ipString, sizeof(ipString));
-    int clientPort = ntohs(clientAddress.sin6_port);
-
-    // assign an ID to this new client
-    clientIDMap[clientSocket] = nextClientID;
-
-    // print "Client <ID> accepted..."
-    printf("Client %d accepted.  Client IP: %s Client Port Number: %d\n",
-           nextClientID, ipString, clientPort);
-
-    // increment for next client
-    nextClientID++;
-
-    // now add it to the poll set
-    addToPollSet(clientSocket);
+    uint8_t finish = 13;
+    sendPDU(sock, &finish, 1);
 }
 
-/*
- * processClient():
- *   - uses recvPDU() to read data
- *   - if ret=0 => client closed => removeFromPollSet, close()
- *   - else => print "Message received on socket X from client Y, length..., Data..."
- *   - echo it back
- */
-static void processClient(int clientSocket)
-{
-    uint8_t dataBuffer[MAXBUF];
-    int recvLen = recvPDU(clientSocket, dataBuffer, MAXBUF);
-
-    if (recvLen < 0)
-    {
-        fprintf(stderr, "Error on recvPDU for socket %d\n", clientSocket);
-        removeFromPollSet(clientSocket);
-        close(clientSocket);
-        return;
-    }
-    else if (recvLen == 0)
-    {
-        // client closed 
-        printf("Client %d closed connection (socket %d)\n", clientIDMap[clientSocket], clientSocket);
-        removeFromPollSet(clientSocket);
-        close(clientSocket);
-        return;
-    }
-
-    // get that client's ID
-    int clientID = clientIDMap[clientSocket];
-
-    // we got a message => print
-    // Example: "Message received on socket 5 from client 2, length: 4, Data: dab"
-    printf("Message received on socket %d from client %d, length: %d, Data: %s\n",
-           clientSocket, clientID, recvLen, dataBuffer);
-
-    // echo it back
-    int sent = sendPDU(clientSocket, dataBuffer, recvLen);
-    if (sent < 0)
-    {
-        fprintf(stderr, "Error on sendPDU to client %d\n", clientID);
-        removeFromPollSet(clientSocket);
-        close(clientSocket);
-    }
-}
-
-int checkArgs(int argc, char *argv[])
-{
-    // single optional argument => port number
-    int portNumber = 0;
-
-    if (argc > 2)
-    {
-        fprintf(stderr, "Usage: %s [optional port number]\n", argv[0]);
-        exit(-1);
-    }
-
-    if (argc == 2)
-    {
-        portNumber = atoi(argv[1]);
-    }
-
-    return portNumber;
+void sendErrorPacket(int sock, const char *destHandle) {
+    /* Build error packet: flag=7, then 1-byte handle length, then destHandle */
+    uint8_t pkt[1 + 1 + MAX_HANDLE];
+    int off = 0;
+    pkt[off++] = 7;
+    uint8_t hlen = (uint8_t) strlen(destHandle);
+    pkt[off++] = hlen;
+    memcpy(pkt + off, destHandle, hlen);
+    off += hlen;
+    sendPDU(sock, pkt, off);
 }
