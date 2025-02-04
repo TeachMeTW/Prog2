@@ -171,7 +171,12 @@ static void processUserInput(int socketNum) {
 static void handleCommand(const char *input, int socketNum) {
     /* All valid commands must begin with the '%' character */
     if (input[0] != '%') {
-        printf("Invalid command\n");
+        printf("Invalid command. Proper usage:\n");
+        printf("%%M <dest_handle> <text>\n");
+        printf("%%B <text>\n");
+        printf("%%C <num> <dest1> <dest2> ... <destN> <text>\n");
+        printf("%%L\n");
+        printf("%%h\n");
         printf("$: ");
         fflush(stdout);
         return;
@@ -185,7 +190,7 @@ static void handleCommand(const char *input, int socketNum) {
         char *token = strtok(copy, " ");        // Token 1: "%M"
         token = strtok(NULL, " ");              // Token 2: destination handle
         if (!token) {
-            printf("Invalid command format\n");
+            printf("Invalid command format. Usage: %%M <dest_handle> <text>\n");
             free(copy);
             printf("$: ");
             fflush(stdout);
@@ -276,7 +281,7 @@ static void handleCommand(const char *input, int socketNum) {
         char *token = strtok(copy, " ");  // Token 1: "%C"
         token = strtok(NULL, " ");        // Token 2: number of handles
         if (!token) {
-            printf("Invalid command format\n");
+            printf("Invalid command format. Usage: %%C <num> <dest1> <dest2> ... <destN> <text>\n");
             free(copy);
             printf("$: ");
             fflush(stdout);
@@ -296,7 +301,7 @@ static void handleCommand(const char *input, int socketNum) {
         for (int i = 0; i < numHandles; i++) {
             token = strtok(NULL, " ");
             if (!token) {
-                printf("Invalid command format\n");
+                printf("Invalid command format. Usage: %%C <num> <dest1> <dest2> ... <destN> <text>\n");
                 free(copy);
                 printf("$: ");
                 fflush(stdout);
@@ -368,7 +373,12 @@ static void handleCommand(const char *input, int socketNum) {
     }
     else {
         // If the command is not recognized, inform the user.
-        printf("Invalid command\n");
+        printf("Invalid command. Proper usage:\n");
+        printf("%%M <dest_handle> <text>\n");
+        printf("%%B <text>\n");
+        printf("%%C <num> <dest1> <dest2> ... <destN> <text>\n");
+        printf("%%L\n");
+        printf("%%h\n");
     }
     // Reprint the prompt after processing the command.
     printf("$: ");
